@@ -4,7 +4,8 @@ import {
   Check, X, Flame, Zap, Trophy, Star, Sparkles, Award, Calendar, Droplet,
   Dumbbell, ChevronRight, Crown, Rocket, Edit2, Save, ArrowUp, ArrowDown,
   Briefcase, Plane, Car, GraduationCap, Coins, Heart, Salad, Scale,
-  BarChart3, Settings, Cherry, Wheat, Egg, Cookie
+  BarChart3, Settings, Cherry, Wheat, Egg, Cookie,
+  Palette, Gift, Medal, History, Lock
 } from 'lucide-react';
 import {
   LineChart, Line, BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, Tooltip,
@@ -89,7 +90,15 @@ const DEFAULT_STATE = {
     travel: { target: 2000, current: 0, transactions: [] },
     car: { target: 15000, current: 0, transactions: [] },
     drivingSchool: { target: 800, current: 0, transactions: [] },
-    educationLoan: { total: 500000, paid: 0, transactions: [] }
+    // Education loan (amortizing). principal = outstanding balance when tracking began.
+    educationLoan: {
+      principal: 5396535, // ₹ outstanding principal
+      rate: 9.74,         // annual interest rate %
+      emi: 43802,         // monthly EMI in ₹
+      tenureMonths: 63,   // months remaining at start
+      paid: 0,            // total principal+interest paid via logged payments
+      transactions: []
+    }
   },
   goals: { daily: [], weekly: [], monthly: [] },
   health: {
@@ -105,7 +114,9 @@ const DEFAULT_STATE = {
     weightGoal: 0,
     weightUnit: 'lbs'
   },
-  investments: [] // {id, name, type, invested, current, notes, date}
+  investments: [], // {id, name, type, invested, current, notes, date}
+  ui: { theme: 'space' },
+  rewards: { claimed: [] } // ['biweekly-<periodKey>', ...]
 };
 
 // =============================================================================
@@ -128,6 +139,51 @@ const xpAtLevel = (l) => 25 * l * (l - 1);
 const xpForNext = (l) => 25 * (l + 1) * l;
 const daysBetween = (a, b) => Math.floor((new Date(b) - new Date(a)) / 86400000);
 
+// Loan amortization: applies logged payments in date order against the outstanding
+// principal, then projects months remaining at the standard EMI.
+const loanState = (loan) => {
+  const r = (loan.rate / 100) / 12;
+  let balance = loan.principal || 0;
+  let totalInterest = 0, totalPaid = 0;
+  const payments = [...(loan.transactions || [])].sort((a, b) => new Date(a.date) - new Date(b.date));
+  for (const p of payments) {
+    if (balance <= 0) break;
+    const interest = balance * r;
+    totalPaid += p.amount;
+    totalInterest += Math.min(interest, p.amount);
+    balance = Math.max(0, balance - (p.amount - interest));
+  }
+  const E = loan.emi || 0;
+  let monthsLeft = 0;
+  if (balance > 0) {
+    if (E > balance * r) monthsLeft = Math.ceil(-Math.log(1 - (r * balance) / E) / Math.log(1 + r));
+    else monthsLeft = Infinity;
+  }
+  const projInterest = monthsLeft === Infinity ? Infinity : Math.max(0, monthsLeft * E - balance);
+  const startBalance = loan.principal || 0;
+  const pct = startBalance ? Math.min(100, ((startBalance - balance) / startBalance) * 100) : 0;
+  return { balance, totalInterest, totalPaid, monthsLeft, projInterest, pct, paymentsCount: payments.length };
+};
+const fmtMonths = (m) => {
+  if (m === Infinity) return '∞';
+  const y = Math.floor(m / 12), mo = m % 12;
+  if (y && mo) return `${y}y ${mo}m`;
+  if (y) return `${y}y`;
+  return `${mo}m`;
+};
+
+// Reward period keys (used to track which rewards have been claimed in which period)
+const biweekKey = (d = new Date()) => {
+  const start = new Date(2025, 0, 5); // anchor (a Sunday)
+  const weeks = Math.floor((new Date(d) - start) / (7 * 86400000));
+  return `bw-${Math.floor(weeks / 2)}`;
+};
+const quarterKey = (d = new Date()) => {
+  const date = new Date(d);
+  return `${date.getFullYear()}-Q${Math.floor(date.getMonth() / 3) + 1}`;
+};
+const yearKey = (d = new Date()) => `${new Date(d).getFullYear()}`;
+
 const deepMerge = (target, source) => {
   if (!source) return target;
   const out = Array.isArray(target) ? [...source] : { ...target };
@@ -143,13 +199,13 @@ const deepMerge = (target, source) => {
 
 const loadState = async () => {
   try {
-    const r = await window.storage.get(STORAGE_KEY);
-    if (r?.value) return deepMerge(DEFAULT_STATE, JSON.parse(r.value));
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return deepMerge(DEFAULT_STATE, JSON.parse(raw));
   } catch {}
   return DEFAULT_STATE;
 };
 const saveState = async (state) => {
-  try { await window.storage.set(STORAGE_KEY, JSON.stringify(state)); }
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
   catch (e) { console.error('save failed', e); }
 };
 
@@ -200,7 +256,478 @@ const Toast = ({ toast }) => {
 // =============================================================================
 // HEADER + NAV
 // =============================================================================
-const Header = ({ state }) => {
+// =============================================================================
+// THEMES + ANIMATED BACKGROUNDS
+// =============================================================================
+const THEMES = {
+  space:   { id: 'space',   label: 'Deep Space',     emoji: '🌌', bg: 'linear-gradient(180deg, #100A24 0%, #0A0618 100%)' },
+  ocean:   { id: 'ocean',   label: 'Ocean Waves',    emoji: '🌊', bg: 'linear-gradient(180deg, #07273F 0%, #04141F 100%)' },
+  blossom: { id: 'blossom', label: 'Cherry Blossom', emoji: '🌸', bg: 'linear-gradient(180deg, #2B1533 0%, #190C21 100%)' },
+  cats:    { id: 'cats',    label: 'Cat World',      emoji: '🐱', bg: 'linear-gradient(180deg, #2C2017 0%, #1A130D 100%)' },
+};
+const CAT_SPRITES = ['🐱', '😺', '😸', '🐈', '🐾', '🧶', '🐟', '😻'];
+
+const AnimatedBackground = ({ theme }) => {
+  const t = theme || 'space';
+  if (t === 'space') {
+    return (
+      <div className="fixed inset-0 z-0 overflow-hidden pointer-events-none">
+        <div className="absolute rounded-full" style={{ width: 320, height: 320, top: '-6%', left: '-12%', background: `radial-gradient(circle, ${C.violet}33, transparent 70%)`, animation: 'auroraShift 16s ease-in-out infinite' }} />
+        <div className="absolute rounded-full" style={{ width: 340, height: 340, bottom: '-10%', right: '-14%', background: `radial-gradient(circle, ${C.cyan}22, transparent 70%)`, animation: 'auroraShift 22s ease-in-out infinite reverse' }} />
+        {Array.from({ length: 46 }).map((_, i) => (
+          <div key={i} className="absolute rounded-full" style={{ width: i % 5 === 0 ? 3 : 2, height: i % 5 === 0 ? 3 : 2, background: '#fff', top: `${(i * 53) % 100}%`, left: `${(i * 37) % 100}%`, opacity: 0.55, animation: `twinkle ${2 + (i % 4)}s ease-in-out infinite`, animationDelay: `${(i % 7) * 0.4}s` }} />
+        ))}
+        <div className="absolute" style={{ top: '14%', left: '-12%', width: 110, height: 2, background: 'linear-gradient(90deg, transparent, #fff)', borderRadius: 9, animation: 'shoot 7s linear infinite', animationDelay: '1s' }} />
+        <div className="absolute" style={{ top: '44%', left: '-12%', width: 80, height: 2, background: 'linear-gradient(90deg, transparent, #fff)', borderRadius: 9, animation: 'shoot 11s linear infinite', animationDelay: '5s' }} />
+      </div>
+    );
+  }
+  if (t === 'ocean') {
+    return (
+      <div className="fixed inset-0 z-0 overflow-hidden pointer-events-none">
+        <div className="absolute rounded-full" style={{ width: 300, height: 300, top: '-8%', right: '-10%', background: `radial-gradient(circle, ${C.cyan}22, transparent 70%)`, animation: 'auroraShift 18s ease-in-out infinite' }} />
+        {Array.from({ length: 20 }).map((_, i) => (
+          <div key={i} className="absolute rounded-full" style={{ width: 5 + (i % 4) * 4, height: 5 + (i % 4) * 4, left: `${(i * 61) % 100}%`, bottom: -24, background: C.sky, opacity: 0.18, animation: `rise ${6 + (i % 5)}s linear infinite`, animationDelay: `${(i % 6) * 0.8}s` }} />
+        ))}
+        <div className="absolute" style={{ bottom: -40, left: '-50%', width: '200%', height: 150, background: `${C.cyan}14`, borderRadius: '45%', animation: 'waveMove 13s linear infinite' }} />
+        <div className="absolute" style={{ bottom: -55, left: '-50%', width: '200%', height: 120, background: `${C.sky}14`, borderRadius: '43%', animation: 'waveMove 9s linear infinite reverse' }} />
+      </div>
+    );
+  }
+  if (t === 'blossom') {
+    return (
+      <div className="fixed inset-0 z-0 overflow-hidden pointer-events-none">
+        <div className="absolute rounded-full" style={{ width: 300, height: 300, top: '-6%', left: '-10%', background: `radial-gradient(circle, ${C.rose}33, transparent 70%)`, animation: 'auroraShift 17s ease-in-out infinite' }} />
+        <div className="absolute rounded-full" style={{ width: 280, height: 280, bottom: '-8%', right: '-10%', background: `radial-gradient(circle, ${C.pink}22, transparent 70%)`, animation: 'auroraShift 20s ease-in-out infinite reverse' }} />
+        {Array.from({ length: 18 }).map((_, i) => (
+          <div key={i} className="absolute" style={{ left: `${(i * 61) % 100}%`, top: -34, fontSize: `${12 + (i % 4) * 5}px`, opacity: 0.85, animation: `petalFall ${7 + (i % 5)}s linear infinite`, animationDelay: `${(i % 7) * 0.9}s` }}>🌸</div>
+        ))}
+      </div>
+    );
+  }
+  // cats
+  return (
+    <div className="fixed inset-0 z-0 overflow-hidden pointer-events-none">
+      <div className="absolute rounded-full" style={{ width: 300, height: 300, top: '-6%', right: '-10%', background: `radial-gradient(circle, ${C.peach}33, transparent 70%)`, animation: 'auroraShift 18s ease-in-out infinite' }} />
+      <div className="absolute rounded-full" style={{ width: 280, height: 280, bottom: '-8%', left: '-10%', background: `radial-gradient(circle, ${C.amber}22, transparent 70%)`, animation: 'auroraShift 21s ease-in-out infinite reverse' }} />
+      {Array.from({ length: 16 }).map((_, i) => (
+        <div key={i} className="absolute" style={{ left: `${(i * 53) % 100}%`, top: `${(i * 41) % 100}%`, fontSize: `${16 + (i % 3) * 8}px`, opacity: 0.7, animation: `floatDrift ${8 + (i % 5)}s ease-in-out infinite`, animationDelay: `${(i % 6) * 0.7}s` }}>
+          {CAT_SPRITES[i % CAT_SPRITES.length]}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const ThemePicker = ({ theme, setTheme }) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen(!open)}
+        className="w-8 h-8 rounded-full flex items-center justify-center"
+        style={{ background: `${C.violet}22`, border: `1px solid ${C.violet}44` }}>
+        <Palette size={14} style={{ color: C.violet }} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-10 z-50 p-2 rounded-2xl w-44 animate-slideIn"
+          style={{ background: 'rgba(27,17,56,0.98)', border: `1px solid ${C.border}`, boxShadow: '0 10px 40px rgba(0,0,0,0.5)' }}>
+          <div className="text-[10px] uppercase tracking-wider px-2 py-1 font-semibold" style={{ color: C.muted }}>Theme</div>
+          {Object.values(THEMES).map(th => (
+            <button key={th.id} onClick={() => { setTheme(th.id); setOpen(false); }}
+              className="w-full flex items-center gap-2 px-2 py-2 rounded-xl text-sm transition-all"
+              style={{ background: theme === th.id ? `${C.violet}22` : 'transparent', color: theme === th.id ? C.text : C.muted }}>
+              <span className="text-lg">{th.emoji}</span>
+              <span>{th.label}</span>
+              {theme === th.id && <Check size={14} style={{ color: C.violet, marginLeft: 'auto' }} />}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// =============================================================================
+// BADGES / CHIPS
+// =============================================================================
+const tierFromPct = (pct) => {
+  if (pct >= 100) return { label: 'Complete', icon: '🏆', rank: 4 };
+  if (pct >= 75) return { label: 'Gold', icon: '🥇', rank: 3 };
+  if (pct >= 50) return { label: 'Silver', icon: '🥈', rank: 2 };
+  if (pct >= 25) return { label: 'Bronze', icon: '🥉', rank: 1 };
+  return null;
+};
+
+const computeBadges = (state) => {
+  const today = todayStr();
+  const groups = [];
+
+  // Money chips (one per fund/loan, tiered)
+  const money = BUDGET_CATEGORIES.map(c => {
+    let pct;
+    if (c.type === 'debt') pct = loanState(state.budget.educationLoan).pct;
+    else { const cat = state.budget[c.key]; pct = cat.target ? (cat.current / cat.target) * 100 : 0; }
+    return { key: c.key, label: c.label, color: c.color, tier: tierFromPct(pct), pct };
+  });
+  groups.push({ title: 'Money', icon: Coins, color: C.amber, items: money });
+
+  // Task chips
+  const u = state.user;
+  const tasks = [
+    { key: 't7', label: '7-Day Streak', color: C.coral, icon: '🔥', earned: u.bestStreak >= 7 },
+    { key: 't30', label: '30-Day Streak', color: C.coral, icon: '⚡', earned: u.bestStreak >= 30 },
+    { key: 't50', label: '50 Tasks', color: C.lime, icon: '🏅', earned: u.totalTasks >= 50 },
+    { key: 't100', label: '100 Tasks', color: C.lime, icon: '🎖️', earned: u.totalTasks >= 100 },
+  ];
+  groups.push({ title: 'Tasks', icon: ListChecks, color: C.cyan, items: tasks });
+
+  // Health chips
+  const waterToday = state.health.water[today] || 0;
+  const exDoneToday = Object.keys(state.health.exerciseDone).filter(k => k.startsWith(today) && state.health.exerciseDone[k]).length;
+  const mealsToday = state.health.nutrition.meals.filter(m => m.date === today).length;
+  const health = [
+    { key: 'hydrate', label: 'Hydrated', color: C.cyan, icon: '💧', earned: waterToday >= state.health.waterTarget },
+    { key: 'active', label: 'Active', color: C.emerald, icon: '💪', earned: exDoneToday > 0 },
+    { key: 'nourished', label: 'Nourished', color: C.coral, icon: '🥗', earned: mealsToday > 0 },
+    { key: 'weighIn', label: 'Weigh-In', color: C.violet, icon: '⚖️', earned: state.health.weight.some(w => w.date === today) },
+  ];
+  groups.push({ title: 'Health (today)', icon: Activity, color: C.emerald, items: health });
+
+  // Investment chips
+  const inv = state.investments;
+  const totalGain = inv.reduce((s, i) => s + (i.current - i.invested), 0);
+  const investments = [
+    { key: 'firstInv', label: 'First Investment', color: C.violet, icon: '🌱', earned: inv.length >= 1 },
+    { key: 'green', label: 'In The Green', color: C.emerald, icon: '📈', earned: inv.length > 0 && totalGain >= 0 },
+    { key: 'diversified', label: 'Diversified', color: C.amber, icon: '💎', earned: new Set(inv.map(i => i.type)).size >= 3 },
+  ];
+  groups.push({ title: 'Investments', icon: TrendingUp, color: C.violet, items: investments });
+
+  return groups;
+};
+
+const BadgeShelf = ({ state }) => {
+  const groups = computeBadges(state);
+  return (
+    <div className="p-5 rounded-3xl" style={{ background: C.surface, border: `1px solid ${C.border}` }}>
+      <div className="flex items-center gap-2 mb-4">
+        <Medal size={16} style={{ color: C.amber }} />
+        <div className="text-xs uppercase tracking-wider font-semibold" style={{ color: C.text }}>Badges & Chips</div>
+      </div>
+      <div className="space-y-4">
+        {groups.map(g => {
+          const Icon = g.icon;
+          return (
+            <div key={g.title}>
+              <div className="flex items-center gap-1.5 mb-2">
+                <Icon size={12} style={{ color: g.color }} />
+                <span className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: g.color }}>{g.title}</span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {g.items.map(it => {
+                  const earned = it.tier ? true : it.earned;
+                  const icon = it.tier ? it.tier.icon : it.icon;
+                  const sub = it.tier ? it.tier.label : null;
+                  return (
+                    <div key={it.key} className="px-2.5 py-1.5 rounded-full flex items-center gap-1.5 text-[11px]"
+                      style={{
+                        background: earned ? `${it.color}1F` : C.surface2,
+                        border: `1px solid ${earned ? it.color + '66' : C.border}`,
+                        opacity: earned ? 1 : 0.4
+                      }}>
+                      <span>{earned ? icon : '🔒'}</span>
+                      <span style={{ color: earned ? it.color : C.muted }}>{it.label}{sub ? ` · ${sub}` : ''}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+// =============================================================================
+// REWARDS
+// =============================================================================
+const REWARDS = [
+  { id: 'biweekly',  label: 'Biweekly Treat',   reward: 'Dessert of your choice', emoji: '🍰', need: 14,  color: C.pink,   period: biweekKey },
+  { id: 'monthly',   label: 'Monthly Reward',   reward: 'Takeout night',          emoji: '🥡', need: 30,  color: C.amber,  period: monthKey },
+  { id: 'quarterly', label: 'Quarterly Reward', reward: 'Buy a new dress',        emoji: '👗', need: 90,  color: C.violet, period: quarterKey },
+  { id: 'yearly',    label: 'Yearly Reward',    reward: '$100 for anything',      emoji: '💰', need: 365, color: C.lime,   period: yearKey },
+];
+
+const RewardTracker = ({ state, claimReward }) => {
+  const streak = state.user.streak;
+  const claimed = state.rewards?.claimed || [];
+  return (
+    <div className="space-y-3">
+      <div className="text-center py-1">
+        <div className="text-xs uppercase tracking-wider font-semibold" style={{ color: C.pink }}>streak rewards</div>
+        <div className="text-[10px]" style={{ color: C.muted }}>keep your daily streak alive to unlock treats</div>
+      </div>
+      {REWARDS.map(r => {
+        const pct = Math.min(100, (streak / r.need) * 100);
+        const unlocked = streak >= r.need;
+        const claimKey = `${r.id}-${r.period()}`;
+        const isClaimed = claimed.includes(claimKey);
+        return (
+          <div key={r.id} className="p-4 rounded-2xl relative overflow-hidden"
+            style={{ background: `linear-gradient(135deg, ${C.surface}, ${r.color}12)`, border: `1px solid ${r.color}33` }}>
+            <div className="flex items-center gap-3 mb-2">
+              <div className="w-11 h-11 rounded-xl flex items-center justify-center text-2xl"
+                style={{ background: `${r.color}20`, filter: unlocked ? 'none' : 'grayscale(1)', opacity: unlocked ? 1 : 0.6 }}>
+                {r.emoji}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-sm" style={{ color: C.text }}>{r.label}</div>
+                <div className="text-[11px]" style={{ color: C.muted }}>{r.reward}</div>
+              </div>
+              {unlocked ? (
+                isClaimed ? (
+                  <div className="text-[11px] font-semibold px-2.5 py-1 rounded-full" style={{ background: `${C.emerald}22`, color: C.emerald }}>Claimed ✓</div>
+                ) : (
+                  <button onClick={() => claimReward(claimKey)}
+                    className="text-[11px] font-bold px-3 py-1.5 rounded-full" style={{ background: r.color, color: C.bg }}>Claim 🎉</button>
+                )
+              ) : (
+                <div className="flex items-center gap-1 text-[11px]" style={{ color: C.muted }}>
+                  <Lock size={11} /> {r.need - streak}d
+                </div>
+              )}
+            </div>
+            <div className="h-1.5 rounded-full overflow-hidden" style={{ background: C.surface2 }}>
+              <div className="h-full transition-all duration-700 rounded-full" style={{ width: `${pct}%`, background: r.color, boxShadow: `0 0 8px ${r.color}88` }} />
+            </div>
+            <div className="text-[10px] mt-1 tabular-nums" style={{ color: C.muted }}>{Math.min(streak, r.need)} / {r.need} day streak</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+// =============================================================================
+// HEALTH HISTORY (weekly / monthly / quarterly / yearly summaries)
+// =============================================================================
+const inPeriod = (dateStr, period) => {
+  if (!dateStr) return false;
+  const d = new Date(dateStr), now = new Date();
+  if (period === 'week') return d >= new Date(weekKey());
+  if (period === 'month') return dateStr.slice(0, 7) === monthKey();
+  if (period === 'quarter') return quarterKey(d) === quarterKey();
+  if (period === 'year') return d.getFullYear() === now.getFullYear();
+  return false;
+};
+
+const HealthHistory = ({ state }) => {
+  const [period, setPeriod] = useState('week');
+  const periods = [
+    { id: 'week', label: 'Week' },
+    { id: 'month', label: 'Month' },
+    { id: 'quarter', label: 'Quarter' },
+    { id: 'year', label: 'Year' },
+  ];
+
+  // Workouts: distinct active days + exercises done
+  const exKeys = Object.keys(state.health.exerciseDone).filter(k => state.health.exerciseDone[k]);
+  const exInPeriod = exKeys.filter(k => inPeriod(k.slice(0, 10), period));
+  const activeDays = new Set(exInPeriod.map(k => k.slice(0, 10))).size;
+
+  // Meals + avg macros per logged day
+  const meals = state.health.nutrition.meals.filter(m => inPeriod(m.date, period));
+  const mealDays = new Set(meals.map(m => m.date)).size || 1;
+  const macroAvg = meals.reduce((a, m) => ({
+    protein: a.protein + (m.protein || 0), carbs: a.carbs + (m.carbs || 0),
+    fiber: a.fiber + (m.fiber || 0), calories: a.calories + (m.calories || 0)
+  }), { protein: 0, carbs: 0, fiber: 0, calories: 0 });
+
+  // Water avg per day
+  const waterEntries = Object.entries(state.health.water).filter(([d]) => inPeriod(d, period));
+  const waterAvg = waterEntries.length ? waterEntries.reduce((s, [, v]) => s + v, 0) / waterEntries.length : 0;
+
+  // Weight change
+  const weights = state.health.weight.filter(w => inPeriod(w.date, period)).sort((a, b) => new Date(a.date) - new Date(b.date));
+  const wChange = weights.length > 1 ? weights[weights.length - 1].value - weights[0].value : 0;
+
+  const cards = [
+    { label: 'Active Days', value: activeDays, sub: 'workouts logged', color: C.emerald, icon: Dumbbell },
+    { label: 'Exercises Done', value: exInPeriod.length, sub: 'total reps logged', color: C.lime, icon: Check },
+    { label: 'Meals Logged', value: meals.length, sub: `${Math.round(macroAvg.protein / mealDays)}g protein/day avg`, color: C.coral, icon: Salad },
+    { label: 'Avg Water', value: waterAvg.toFixed(1), sub: 'glasses per day', color: C.cyan, icon: Droplet },
+    { label: 'Avg Calories', value: Math.round(macroAvg.calories / mealDays), sub: 'per logged day', color: C.amber, icon: Cookie },
+    { label: 'Weight Change', value: `${wChange > 0 ? '+' : ''}${wChange.toFixed(1)}`, sub: state.health.weightUnit, color: wChange <= 0 ? C.emerald : C.coral, icon: Scale },
+  ];
+
+  return (
+    <div className="space-y-3">
+      <div className="flex gap-1 p-1 rounded-2xl" style={{ background: C.surface, border: `1px solid ${C.border}` }}>
+        {periods.map(p => (
+          <button key={p.id} onClick={() => setPeriod(p.id)}
+            className="flex-1 py-1.5 rounded-xl text-[11px] font-semibold transition-all"
+            style={{ background: period === p.id ? `${C.emerald}22` : 'transparent', color: period === p.id ? C.emerald : C.muted }}>
+            {p.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-2 gap-3">
+        {cards.map(c => {
+          const Icon = c.icon;
+          return (
+            <div key={c.label} className="p-4 rounded-2xl"
+              style={{ background: `linear-gradient(135deg, ${C.surface}, ${c.color}10)`, border: `1px solid ${c.color}33` }}>
+              <div className="flex items-center justify-between mb-2">
+                <div className="text-[10px] uppercase tracking-wider font-semibold" style={{ color: C.muted }}>{c.label}</div>
+                <Icon size={14} style={{ color: c.color }} />
+              </div>
+              <div className="text-2xl font-bold tabular-nums" style={{ color: c.color, fontFamily: 'JetBrains Mono, monospace' }}>{c.value}</div>
+              <div className="text-[10px] mt-1" style={{ color: C.muted }}>{c.sub}</div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+// =============================================================================
+// LOAN CALCULATOR CARD
+// =============================================================================
+const LoanCard = ({ loan, onAddPayment, onDeletePayment, onEditLoan }) => {
+  const [showAdd, setShowAdd] = useState(false);
+  const [showEdit, setShowEdit] = useState(false);
+  const [amount, setAmount] = useState(loan.emi);
+  const [note, setNote] = useState('');
+  const [p, setP] = useState(loan.principal);
+  const [rate, setRate] = useState(loan.rate);
+  const [emi, setEmi] = useState(loan.emi);
+
+  const calc = loanState(loan);
+  const handleAdd = () => {
+    const amt = parseFloat(amount);
+    if (!isNaN(amt) && amt > 0) { onAddPayment(amt, note); setNote(''); setShowAdd(false); }
+  };
+
+  return (
+    <div className="p-4 rounded-2xl" style={{ background: `linear-gradient(135deg, ${C.surface}, ${C.violet}0C)`, border: `1px solid ${C.violet}33` }}>
+      <div className="flex items-start justify-between mb-3">
+        <div className="flex items-center gap-2.5">
+          <div className="w-10 h-10 rounded-xl flex items-center justify-center" style={{ background: `${C.violet}20` }}>
+            <GraduationCap size={18} style={{ color: C.violet }} />
+          </div>
+          <div>
+            <div className="font-semibold text-sm" style={{ color: C.text }}>Education Loan</div>
+            <div className="text-[10px] uppercase tracking-wider" style={{ color: C.muted }}>amortizing • INR</div>
+          </div>
+        </div>
+        <button onClick={() => setShowEdit(!showEdit)}><Settings size={14} style={{ color: C.muted }} /></button>
+      </div>
+
+      {showEdit && (
+        <div className="mb-3 p-3 rounded-xl space-y-2" style={{ background: C.surface2 }}>
+          <div className="text-[10px] uppercase tracking-wider" style={{ color: C.muted }}>loan details</div>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] w-24" style={{ color: C.text }}>Principal ₹</span>
+            <input type="number" value={p} onChange={e => setP(e.target.value)}
+              className="flex-1 px-3 py-1.5 rounded-lg text-sm outline-none tabular-nums"
+              style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, fontFamily: 'JetBrains Mono, monospace' }} />
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] w-24" style={{ color: C.text }}>Rate % p.a.</span>
+            <input type="number" step="0.01" value={rate} onChange={e => setRate(e.target.value)}
+              className="flex-1 px-3 py-1.5 rounded-lg text-sm outline-none tabular-nums"
+              style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, fontFamily: 'JetBrains Mono, monospace' }} />
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] w-24" style={{ color: C.text }}>EMI ₹/mo</span>
+            <input type="number" value={emi} onChange={e => setEmi(e.target.value)}
+              className="flex-1 px-3 py-1.5 rounded-lg text-sm outline-none tabular-nums"
+              style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, fontFamily: 'JetBrains Mono, monospace' }} />
+          </div>
+          <button onClick={() => { onEditLoan({ principal: parseFloat(p) || 0, rate: parseFloat(rate) || 0, emi: parseFloat(emi) || 0 }); setShowEdit(false); }}
+            className="w-full py-2 rounded-lg text-xs font-semibold" style={{ background: C.violet, color: C.bg }}>save details</button>
+        </div>
+      )}
+
+      {/* Outstanding balance */}
+      <div className="mb-3">
+        <div className="text-[10px] uppercase tracking-wider" style={{ color: C.muted }}>outstanding balance</div>
+        <div className="text-3xl font-bold tabular-nums" style={{ color: C.violet, fontFamily: 'JetBrains Mono, monospace' }}>{fmtINR(Math.round(calc.balance))}</div>
+        <div className="h-2 rounded-full overflow-hidden mt-2" style={{ background: C.surface2 }}>
+          <div className="h-full transition-all duration-700 rounded-full" style={{ width: `${calc.pct}%`, background: `linear-gradient(90deg, ${C.violet}aa, ${C.violet})`, boxShadow: `0 0 12px ${C.violet}77` }} />
+        </div>
+        <div className="text-[10px] mt-1" style={{ color: C.muted }}>{calc.pct.toFixed(1)}% paid off</div>
+      </div>
+
+      {/* Key numbers */}
+      <div className="grid grid-cols-2 gap-2 mb-3">
+        <div className="p-2.5 rounded-xl" style={{ background: C.surface2 }}>
+          <div className="text-[9px] uppercase tracking-wider" style={{ color: C.muted }}>time left</div>
+          <div className="text-base font-bold tabular-nums" style={{ color: C.text, fontFamily: 'JetBrains Mono, monospace' }}>{fmtMonths(calc.monthsLeft)}</div>
+          <div className="text-[9px]" style={{ color: C.muted }}>{calc.monthsLeft === Infinity ? 'EMI too low' : `${calc.monthsLeft} payments`}</div>
+        </div>
+        <div className="p-2.5 rounded-xl" style={{ background: C.surface2 }}>
+          <div className="text-[9px] uppercase tracking-wider" style={{ color: C.muted }}>interest left</div>
+          <div className="text-base font-bold tabular-nums" style={{ color: C.coral, fontFamily: 'JetBrains Mono, monospace' }}>{calc.projInterest === Infinity ? '∞' : fmtINR(Math.round(calc.projInterest))}</div>
+          <div className="text-[9px]" style={{ color: C.muted }}>at ₹{(loan.emi || 0).toLocaleString('en-IN')}/mo</div>
+        </div>
+        <div className="p-2.5 rounded-xl" style={{ background: C.surface2 }}>
+          <div className="text-[9px] uppercase tracking-wider" style={{ color: C.muted }}>rate</div>
+          <div className="text-base font-bold tabular-nums" style={{ color: C.amber, fontFamily: 'JetBrains Mono, monospace' }}>{loan.rate}%</div>
+          <div className="text-[9px]" style={{ color: C.muted }}>per annum</div>
+        </div>
+        <div className="p-2.5 rounded-xl" style={{ background: C.surface2 }}>
+          <div className="text-[9px] uppercase tracking-wider" style={{ color: C.muted }}>total paid</div>
+          <div className="text-base font-bold tabular-nums" style={{ color: C.emerald, fontFamily: 'JetBrains Mono, monospace' }}>{fmtINR(Math.round(calc.totalPaid))}</div>
+          <div className="text-[9px]" style={{ color: C.muted }}>{calc.paymentsCount} payments</div>
+        </div>
+      </div>
+
+      <button onClick={() => setShowAdd(!showAdd)}
+        className="w-full py-2 rounded-lg text-xs font-semibold flex items-center justify-center gap-1.5"
+        style={{ background: showAdd ? C.surface2 : `${C.violet}15`, color: C.violet, border: `1px dashed ${C.violet}55` }}>
+        <Plus size={12} /> Log a payment
+      </button>
+
+      {showAdd && (
+        <div className="mt-3 space-y-2">
+          <input type="number" value={amount} onChange={e => setAmount(e.target.value)} placeholder="Payment amount" autoFocus
+            className="w-full px-3 py-2 rounded-lg text-sm outline-none tabular-nums"
+            style={{ background: C.surface2, color: C.text, border: `1px solid ${C.border}`, fontFamily: 'JetBrains Mono, monospace' }} />
+          <input value={note} onChange={e => setNote(e.target.value)} placeholder="Note (optional)"
+            className="w-full px-3 py-2 rounded-lg text-sm outline-none"
+            style={{ background: C.surface2, color: C.text, border: `1px solid ${C.border}` }} />
+          <button onClick={handleAdd} className="w-full py-2 rounded-lg text-xs font-semibold" style={{ background: C.violet, color: C.bg }}>
+            Log {fmtINR(parseFloat(amount) || 0)}
+          </button>
+        </div>
+      )}
+
+      {loan.transactions.length > 0 && (
+        <div className="mt-3 pt-3" style={{ borderTop: `1px dashed ${C.border}` }}>
+          <div className="text-[10px] uppercase tracking-wider mb-2" style={{ color: C.muted }}>Recent payments</div>
+          <div className="space-y-1.5">
+            {[...loan.transactions].reverse().slice(0, 4).map(t => (
+              <div key={t.id} className="flex items-center justify-between text-xs group">
+                <div className="flex-1 min-w-0">
+                  <div style={{ color: C.text }} className="truncate">{t.note || 'EMI payment'}</div>
+                  <div className="text-[10px]" style={{ color: C.muted }}>{t.date}</div>
+                </div>
+                <div className="tabular-nums font-semibold" style={{ color: C.violet, fontFamily: 'JetBrains Mono, monospace' }}>-{fmtINR(t.amount)}</div>
+                <button onClick={() => onDeletePayment(t.id)} className="ml-2 opacity-0 group-hover:opacity-100"><X size={12} style={{ color: C.muted }} /></button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const Header = ({ state, theme, setTheme }) => {
   const { level, xp, streak } = state.user;
   const cur = xpAtLevel(level), nxt = xpForNext(level);
   const pct = ((xp - cur) / (nxt - cur)) * 100;
@@ -222,6 +749,7 @@ const Header = ({ state }) => {
           </h1>
         </div>
         <div className="flex items-center gap-2">
+          <ThemePicker theme={theme} setTheme={setTheme} />
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full"
             style={{ background: `${C.coral}22`, border: `1px solid ${C.coral}44` }}>
             <Flame size={13} style={{ color: C.coral }} />
@@ -324,9 +852,9 @@ const Dashboard = ({ state, toggleTask }) => {
   const monthSpent = state.budget.weekly.transactions
     .filter(t => t.date.startsWith(mo)).reduce((s, t) => s + t.amount, 0);
 
-  const loanRemaining = state.budget.educationLoan.total - state.budget.educationLoan.paid;
-  const loanPct = state.budget.educationLoan.total
-    ? (state.budget.educationLoan.paid / state.budget.educationLoan.total) * 100 : 0;
+  const loanCalc = loanState(state.budget.educationLoan);
+  const loanRemaining = loanCalc.balance;
+  const loanPct = loanCalc.pct;
 
   return (
     <div className="px-4 pb-24 pt-2 space-y-4">
@@ -443,14 +971,14 @@ const Dashboard = ({ state, toggleTask }) => {
                 <GraduationCap size={11} style={{ color: C.violet }} /> Loan Cleared
               </span>
               <span className="tabular-nums" style={{ color: C.muted, fontFamily: 'JetBrains Mono, monospace' }}>
-                {fmtINR(state.budget.educationLoan.paid)} / {fmtINR(state.budget.educationLoan.total)}
+                {loanPct.toFixed(1)}% • {fmtMonths(loanCalc.monthsLeft)} left
               </span>
             </div>
             <div className="h-1.5 rounded-full overflow-hidden" style={{ background: C.surface2 }}>
               <div className="h-full transition-all duration-700 rounded-full"
                 style={{ width: `${loanPct}%`, background: C.violet, boxShadow: `0 0 8px ${C.violet}66` }} />
             </div>
-            <div className="text-[10px] mt-1" style={{ color: C.muted }}>{fmtINR(loanRemaining)} remaining</div>
+            <div className="text-[10px] mt-1" style={{ color: C.muted }}>{fmtINR(Math.round(loanRemaining))} outstanding</div>
           </div>
         </div>
       </div>
@@ -480,6 +1008,9 @@ const Dashboard = ({ state, toggleTask }) => {
           })}
         </div>
       </div>
+
+      {/* Badges & chips */}
+      <BadgeShelf state={state} />
     </div>
   );
 };
@@ -843,10 +1374,14 @@ const Budget = ({ state, ...handlers }) => {
       </div>
       <WeeklyExpenses state={state} addExpense={handlers.addWeeklyExpense}
         deleteExpense={handlers.deleteWeeklyExpense} setBudget={handlers.setWeeklyBudget} />
-      {BUDGET_CATEGORIES.map(c => (
+      {BUDGET_CATEGORIES.filter(c => c.key !== 'educationLoan').map(c => (
         <BudgetCategoryCard key={c.key} catKey={c.key} cat={state.budget[c.key]} definition={c}
           onAddTxn={handlers.addBudgetTxn} onEditTarget={handlers.editBudgetTarget} onDeleteTxn={handlers.deleteBudgetTxn} />
       ))}
+      <LoanCard loan={state.budget.educationLoan}
+        onAddPayment={(amt, note) => handlers.addBudgetTxn('educationLoan', amt, note)}
+        onDeletePayment={(id) => handlers.deleteBudgetTxn('educationLoan', id)}
+        onEditLoan={handlers.editLoan} />
     </div>
   );
 };
@@ -1687,6 +2222,7 @@ const Health = ({ state, ...handlers }) => {
     { id: 'nutrition', label: 'Nutrition', icon: Salad, color: C.coral },
     { id: 'water', label: 'Water', icon: Droplet, color: C.cyan },
     { id: 'weight', label: 'Weight', icon: Scale, color: C.violet },
+    { id: 'history', label: 'History', icon: History, color: C.pink },
   ];
   const current = tabs.find(t => t.id === tab);
 
@@ -1731,6 +2267,12 @@ const Health = ({ state, ...handlers }) => {
         addWeight={handlers.addWeight}
         deleteWeight={handlers.deleteWeight}
         setGoal={handlers.setWeightGoal} />}
+      {tab === 'history' && (
+        <div className="space-y-5">
+          <HealthHistory state={state} />
+          <RewardTracker state={state} claimReward={handlers.claimReward} />
+        </div>
+      )}
     </div>
   );
 };
@@ -2086,13 +2628,12 @@ export default function App() {
     setState(s => {
       const ns = { ...s, budget: { ...s.budget } };
       const cat = { ...ns.budget[catKey] };
+      const isLoan = catKey === 'educationLoan';
+      const oldPct = isLoan ? loanState(cat).pct : (cat.target ? (cat.current / cat.target) * 100 : 0);
       cat.transactions = [...cat.transactions, { id: uid(), date: todayStr(), amount, note }];
-      const wasCurrent = catKey === 'educationLoan' ? cat.paid : cat.current;
-      const wasTotal = catKey === 'educationLoan' ? cat.total : cat.target;
-      const oldPct = wasTotal ? (wasCurrent / wasTotal) * 100 : 0;
-      if (catKey === 'educationLoan') cat.paid = (cat.paid || 0) + amount;
+      if (isLoan) cat.paid = (cat.paid || 0) + amount;
       else cat.current = (cat.current || 0) + amount;
-      const newPct = wasTotal ? ((catKey === 'educationLoan' ? cat.paid : cat.current) / wasTotal) * 100 : 0;
+      const newPct = isLoan ? loanState(cat).pct : (cat.target ? (cat.current / cat.target) * 100 : 0);
       ns.budget[catKey] = cat;
       [25, 50, 75, 100].forEach(m => {
         if (oldPct < m && newPct >= m) {
@@ -2249,6 +2790,24 @@ export default function App() {
     setState(s => ({ ...s, investments: s.investments.filter(i => i.id !== id)}));
   };
 
+  // LOAN / REWARDS / THEME
+  const editLoan = (fields) => {
+    setState(s => ({ ...s, budget: { ...s.budget, educationLoan: { ...s.budget.educationLoan, ...fields } } }));
+  };
+  const claimReward = (claimKey) => {
+    setState(s => {
+      const claimed = s.rewards?.claimed || [];
+      if (claimed.includes(claimKey)) return s;
+      triggerConfetti();
+      const r = REWARDS.find(x => claimKey.startsWith(x.id + '-'));
+      setTimeout(() => showToast({ type: 'achievement', icon: r?.emoji || '🎉', title: 'Reward unlocked!', desc: r?.reward }), 150);
+      return { ...s, rewards: { ...s.rewards, claimed: [...claimed, claimKey] } };
+    });
+  };
+  const setTheme = (theme) => {
+    setState(s => ({ ...s, ui: { ...s.ui, theme } }));
+  };
+
   if (!loaded) {
     return (
       <div className="min-h-screen flex items-center justify-center" style={{ background: C.bg }}>
@@ -2260,8 +2819,12 @@ export default function App() {
     );
   }
 
+  const theme = state.ui?.theme || 'space';
+  const themeBg = (THEMES[theme] || THEMES.space).bg;
+
   return (
-    <div className="min-h-screen" style={{ background: C.bg, color: C.text, fontFamily: 'Manrope, system-ui, sans-serif' }}>
+    <div className="min-h-screen relative" style={{ background: themeBg, color: C.text, fontFamily: 'Manrope, system-ui, sans-serif' }}>
+      <AnimatedBackground theme={theme} />
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,400;0,700;1,400;1,700&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
         @keyframes confettiFall {
@@ -2273,6 +2836,12 @@ export default function App() {
         @keyframes twinkle { 0%, 100% { opacity: 0.2; transform: scale(1); } 50% { opacity: 1; transform: scale(1.4); } }
         @keyframes bubble { 0%, 100% { transform: translateY(0); opacity: 0.15; } 50% { transform: translateY(-20px); opacity: 0.4; } }
         @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes auroraShift { 0%, 100% { transform: translate(0,0) scale(1); } 50% { transform: translate(30px,20px) scale(1.15); } }
+        @keyframes shoot { 0% { transform: translateX(0) translateY(0); opacity: 0; } 10% { opacity: 1; } 60% { opacity: 1; } 100% { transform: translateX(130vw) translateY(40vh); opacity: 0; } }
+        @keyframes rise { 0% { transform: translateY(0) translateX(0); opacity: 0; } 15% { opacity: 0.3; } 100% { transform: translateY(-110vh) translateX(20px); opacity: 0; } }
+        @keyframes waveMove { 0% { transform: translateX(0) rotate(0deg); } 100% { transform: translateX(-12%) rotate(2deg); } }
+        @keyframes petalFall { 0% { transform: translateY(0) translateX(0) rotate(0deg); opacity: 0; } 10% { opacity: 0.85; } 100% { transform: translateY(110vh) translateX(60px) rotate(360deg); opacity: 0; } }
+        @keyframes floatDrift { 0%, 100% { transform: translateY(0) rotate(-6deg); opacity: 0.6; } 50% { transform: translateY(-22px) rotate(6deg); opacity: 0.85; } }
         .animate-slideIn { animation: slideIn 0.4s ease-out; }
         ::-webkit-scrollbar { width: 0; }
       `}</style>
@@ -2280,21 +2849,21 @@ export default function App() {
       <Confetti active={confetti} />
       <Toast toast={toast} />
 
-      <div className="max-w-2xl mx-auto pb-20">
-        <Header state={state} />
+      <div className="max-w-2xl mx-auto pb-20 relative z-10">
+        <Header state={state} theme={theme} setTheme={setTheme} />
         {active === 'dashboard' && <Dashboard state={state} toggleTask={toggleTask} />}
         {active === 'tasks' && <Tasks state={state} addTask={addTask} toggleTask={toggleTask} deleteTask={deleteTask} />}
         {active === 'budget' && <Budget state={state}
           addWeeklyExpense={addWeeklyExpense} deleteWeeklyExpense={deleteWeeklyExpense}
           setWeeklyBudget={setWeeklyBudget} addBudgetTxn={addBudgetTxn}
-          deleteBudgetTxn={deleteBudgetTxn} editBudgetTarget={editBudgetTarget} />}
+          deleteBudgetTxn={deleteBudgetTxn} editBudgetTarget={editBudgetTarget} editLoan={editLoan} />}
         {active === 'goals' && <Goals state={state}
           addGoal={addGoal} updateGoal={updateGoal} incrementGoal={incrementGoal} deleteGoal={deleteGoal} />}
         {active === 'health' && <Health state={state}
           updateWorkoutDay={updateWorkoutDay} addExercise={addExercise} deleteExercise={deleteExercise}
           toggleExerciseDone={toggleExerciseDone} addMeal={addMeal} deleteMeal={deleteMeal}
           updateNutritionTargets={updateNutritionTargets} setWater={setWater} setWaterTarget={setWaterTarget}
-          addWeight={addWeight} deleteWeight={deleteWeight} setWeightGoal={setWeightGoal} />}
+          addWeight={addWeight} deleteWeight={deleteWeight} setWeightGoal={setWeightGoal} claimReward={claimReward} />}
         {active === 'invest' && <Investments state={state}
           addInvestment={addInvestment} updateInvestmentCurrent={updateInvestmentCurrent}
           deleteInvestment={deleteInvestment} />}
